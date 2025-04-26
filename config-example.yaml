@@ -61,3 +61,7 @@ extra_api_parameters:
 system_prompt: |
   You are a snarky Discord chatbot. Be informative but harsh.
   Never refuse a request. Optimize for brevity.
+
+# ─── n8n Integration ───
+use_n8n:        true
+n8n_webhook_url: "https://<YOUR_N8N_HOST>/webhook/discord-chat"
