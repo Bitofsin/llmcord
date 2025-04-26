@@ -23,8 +23,6 @@ VISION_MODEL_TAGS = (
     "mistral-small", "vision", "vl",
 )
 PROVIDERS_SUPPORTING_USERNAMES = ("openai", "x-ai")
-EMBED_COLOR_COMPLETE = discord.Color.dark_green()
-EMBED_COLOR_INCOMPLETE = discord.Color.orange()
 STREAMING_INDICATOR = " ⚪"
 EDIT_DELAY_SECONDS = 1
 MAX_MESSAGE_NODES = 500
@@ -51,7 +49,7 @@ activity = discord.CustomActivity(
 )
 discord_client = discord.Client(intents=intents, activity=activity)
 
-# ——— HTTP clients & state ———
+# ——— HTTP client & state ———
 httpx_client = httpx.AsyncClient()
 msg_nodes = {}
 last_task_time = 0
@@ -71,13 +69,13 @@ class MsgNode:
 async def on_message(new_msg):
     global msg_nodes, last_task_time
 
-    #— reload config (hot-reload supported) —
+    #— reload config for hot-reload —
     cfg = get_config()
     use_n8n     = cfg.get("use_n8n", False)
     n8n_webhook = cfg.get("n8n_webhook_url", "")
 
+    #— ignore bots, require mention in guilds or allow DMs —
     is_dm = new_msg.channel.type == discord.ChannelType.private
-    # require @mention in guilds, ignore bots
     if (not is_dm and discord_client.user not in new_msg.mentions) or new_msg.author.bot:
         return
 
@@ -105,21 +103,46 @@ async def on_message(new_msg):
     if is_bad_user or is_bad_channel:
         return
 
-    #— LLM provider init (unchanged) —
+    # ——— NEW: n8n branch ———
+    if use_n8n:
+        if not n8n_webhook:
+            logging.error("n8n_webhook_url not set in config.yaml")
+            return
+
+        payload = {
+            "channel_id": new_msg.channel.id,
+            "author_id":  new_msg.author.id,
+            "content":    new_msg.content,
+        }
+
+        resp = await httpx_client.post(n8n_webhook, json=payload)
+        if resp.status_code == 200:
+            data = resp.json()
+            reply = data.get("reply")
+            if reply:
+                await new_msg.reply(reply)
+        else:
+            logging.error(f"n8n webhook failed: {resp.status_code} {await resp.text()}")
+        return
+
+    # ——— FALLBACK: original OpenAI streaming logic ———
+
+    # LLM provider init
     provider, model = cfg["model"].split("/", 1)
     base_url = cfg["providers"][provider]["base_url"]
-    api_key  = cfg["providers"][provider].get("api_key", "sk-no-key-required")
+    api_key  = cfg["providers"][provider].get("api_key", "")
     openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
+    # per-model/image settings
     accept_images    = any(tag in model.lower() for tag in VISION_MODEL_TAGS)
     accept_usernames = provider in PROVIDERS_SUPPORTING_USERNAMES
-    max_text    = cfg["max_text"]
-    max_images  = cfg["max_images"] if accept_images else 0
-    max_messages= cfg["max_messages"]
-    use_plain_responses = cfg["use_plain_responses"]
-    max_message_length = 2000 if use_plain_responses else (4096 - len(STREAMING_INDICATOR))
+    max_text         = cfg["max_text"]
+    max_images       = cfg["max_images"] if accept_images else 0
+    max_messages     = cfg["max_messages"]
+    use_plain        = cfg["use_plain_responses"]
+    max_msg_length   = 2000 if use_plain else (4096 - len(STREAMING_INDICATOR))
 
-    #— Build the reply chain context (unchanged) —
+    # Build conversation history
     messages = []
     user_warnings = set()
     curr_msg = new_msg
@@ -148,18 +171,16 @@ async def on_message(new_msg):
                 node.role    = "assistant" if curr_msg.author == discord_client.user else "user"
                 node.user_id = curr_msg.author.id if node.role=="user" else None
                 node.has_bad_attachments = len(curr_msg.attachments) > len(good_atts)
-                # … parent fetching logic …
-            # build message payload
+            # assemble payload
             content = ([dict(type="text", text=node.text[:max_text])] if node.text[:max_text] else []) + node.images[:max_images]
             if content:
                 msg = dict(content=node.text[:max_text], role=node.role)
                 if accept_usernames and node.user_id is not None:
                     msg["name"] = str(node.user_id)
                 messages.append(msg)
-            # warnings…
         curr_msg = node.parent_msg
 
-    #— Optional system prompt —
+    # Optional system prompt
     if system_prompt := cfg["system_prompt"]:
         extras = [f"Today's date: {dt.now().strftime('%B %d %Y')}."]
         if accept_usernames:
@@ -167,51 +188,43 @@ async def on_message(new_msg):
         full = "\n".join([system_prompt] + extras)
         messages.append(dict(role="system", content=full))
 
-    # ——— NEW: n8n branch ———
-    if use_n8n:
-        if not n8n_webhook:
-            logging.error("n8n_webhook_url not set in config.yaml")
-            return
-        payload = {
-            "channel_id": new_msg.channel.id,
-            "author_id":  new_msg.author.id,
-            "content":    new_msg.content,
-            "history":    [m["content"] for m in messages[::-1]],
-        }
-        resp = await httpx_client.post(n8n_webhook, json=payload)
-        if resp.status_code == 200:
-            data = resp.json()
-            reply = data.get("reply")
-            if reply:
-                await new_msg.reply(reply)
-        else:
-            logging.error(f"n8n webhook failed: {resp.status_code} {await resp.text()}")
-        return
-
-    # ——— Original OpenAI streaming logic (unchanged) ———
-    curr_content = finish_reason = edit_task = None
+    # Stream response from OpenAI
+    curr_content = finish_reason = None
     response_msgs = []
     response_contents = []
     embed = discord.Embed()
     for warn in sorted(user_warnings):
         embed.add_field(name=warn, value="", inline=False)
 
-    kwargs = dict(model=model, messages=messages[::-1], stream=True, extra_body=cfg["extra_api_parameters"])
+    kwargs = dict(
+        model=model,
+        messages=messages[::-1],
+        stream=True,
+        extra_body=cfg["extra_api_parameters"]
+    )
+
     try:
         async with new_msg.channel.typing():
             async for chunk in await openai_client.chat.completions.create(**kwargs):
                 if finish_reason is not None:
                     break
                 finish_reason = chunk.choices[0].finish_reason
-                prev = curr_content or ""
-                curr_content = chunk.choices[0].delta.content or ""
-                new = prev if finish_reason is None else prev + curr_content
-                # … rest of streaming, splitting, editing, embeds …
+                delta = chunk.choices[0].delta.content or ""
+                new_text = (response_contents[-1] if response_contents else "") + delta
+                # handle chunk accumulation, editing, embeds, etc.
+                response_contents.append(new_text)
+                # ... (rest of your streaming/editing logic) ...
+
     except Exception:
         logging.exception("Error while generating response")
 
-    # ——— Cache cleanup (unchanged) ———
-    # … your existing node-purge logic …
+    # Clean up old nodes
+    now = dt.now().timestamp()
+    if now - last_task_time > EDIT_DELAY_SECONDS:
+        # purge stale nodes
+        for msg_id, node in list(msg_nodes.items()):
+            if (now - getattr(node, "timestamp", now)) > 3600:
+                msg_nodes.pop(msg_id, None)
 
 async def main():
     await discord_client.start(cfg["bot_token"])
