@@ -104,21 +104,38 @@ async def on_message(new_msg):
             "author_id":  new_msg.author.id,
             "content":    new_msg.content,
         }
+
         resp = await httpx_client.post(n8n_webhook, json=payload)
+        logging.info(f"n8n status: {resp.status_code}, body: {resp.text!r}")
+
         if resp.status_code == 200:
             try:
                 data = resp.json()
             except ValueError:
-                logging.error("n8n returned invalid JSON: %r", resp.text)
+                logging.error("n8n returned invalid JSON")
                 return
 
-            # handle array vs object
             if isinstance(data, list) and data:
                 data = data[0]
 
             reply = data.get("reply")
+            logging.info(f"Parsed reply: {reply!r}")
+
             if reply:
-                await new_msg.reply(reply)
+                # Attempt to reply to the message
+                try:
+                    logging.info(f"Attempting new_msg.reply(...) in {new_msg.channel}")
+                    await new_msg.reply(reply, mention_author=False)
+                    logging.info("✅ new_msg.reply succeeded")
+                except Exception as e:
+                    logging.error(f"new_msg.reply failed: {e!r}")
+                    # Fallback to channel.send
+                    try:
+                        logging.info(f"Attempting channel.send(...) in {new_msg.channel}")
+                        await new_msg.channel.send(reply)
+                        logging.info("✅ channel.send succeeded")
+                    except Exception as e2:
+                        logging.error(f"channel.send also failed: {e2!r}")
         else:
             logging.error(f"n8n webhook failed: {resp.status_code} {resp.text}")
         return
@@ -136,7 +153,7 @@ async def on_message(new_msg):
     max_messages  = cfg["max_messages"]
     use_plain     = cfg["use_plain_responses"]
 
-    # Build conversation history (simplified for brevity)
+    # Build conversation history (simplified)
     messages = []
     curr = new_msg
     while curr and len(messages) < max_messages:
@@ -165,7 +182,7 @@ async def on_message(new_msg):
     try:
         async with new_msg.channel.typing():
             async for chunk in await openai_client.chat.completions.create(**kwargs):
-                # ... existing chunk handling/editing logic ...
+                # ... your existing chunk handling/editing logic ...
                 pass
     except Exception:
         logging.exception("Error in OpenAI streaming")
