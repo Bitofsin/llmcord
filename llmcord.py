@@ -93,6 +93,15 @@ async def on_message(new_msg):
     if bad_user or bad_ch or not good_user or not good_ch:
         return
 
+    # ——— Capture reply context ———
+    reply_context = None
+    if new_msg.reference and new_msg.reference.message_id:
+        try:
+            ref_msg = await new_msg.channel.fetch_message(new_msg.reference.message_id)
+            reply_context = ref_msg.content
+        except Exception as e:
+            logging.error(f"Failed to fetch referenced message: {e!r}")
+
     # ─── n8n branch ───
     if use_n8n:
         if not n8n_webhook:
@@ -103,6 +112,7 @@ async def on_message(new_msg):
             "channel_id": new_msg.channel.id,
             "author_id":  new_msg.author.id,
             "content":    new_msg.content,
+            "reply_to":   reply_context,
         }
 
         resp = await httpx_client.post(n8n_webhook, json=payload)
@@ -122,14 +132,14 @@ async def on_message(new_msg):
             logging.info(f"Parsed reply: {reply!r}")
 
             if reply:
-                # Attempt to reply to the message
+                # try replying to the message
                 try:
                     logging.info(f"Attempting new_msg.reply(...) in {new_msg.channel}")
                     await new_msg.reply(reply, mention_author=False)
                     logging.info("✅ new_msg.reply succeeded")
                 except Exception as e:
                     logging.error(f"new_msg.reply failed: {e!r}")
-                    # Fallback to channel.send
+                    # fallback to channel.send
                     try:
                         logging.info(f"Attempting channel.send(...) in {new_msg.channel}")
                         await new_msg.channel.send(reply)
@@ -153,8 +163,15 @@ async def on_message(new_msg):
     max_messages  = cfg["max_messages"]
     use_plain     = cfg["use_plain_responses"]
 
-    # Build conversation history (simplified)
+    # Build conversation history
     messages = []
+    # inject reply context for OpenAI if present
+    if reply_context:
+        messages.append({
+            "role": "system",
+            "content": f"Replied to message: {reply_context}"
+        })
+
     curr = new_msg
     while curr and len(messages) < max_messages:
         node = msg_nodes.setdefault(curr.id, MsgNode())
