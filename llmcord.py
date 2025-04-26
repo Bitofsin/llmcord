@@ -7,7 +7,6 @@ from typing import Literal, Optional
 
 import discord
 import httpx
-from openai import AsyncOpenAI
 import yaml
 
 # ——— Logging ———
@@ -22,7 +21,6 @@ VISION_MODEL_TAGS = (
     "gemini", "gemma", "llama", "pixtral",
     "mistral-small", "vision", "vl",
 )
-PROVIDERS_SUPPORTING_USERNAMES = ("openai", "x-ai")
 STREAMING_INDICATOR = " ⚪"
 EDIT_DELAY_SECONDS = 1
 
@@ -51,7 +49,6 @@ discord_client = discord.Client(intents=intents, activity=activity)
 # ——— HTTP client & state ———
 httpx_client = httpx.AsyncClient()
 msg_nodes = {}
-last_task_time = 0
 
 @dataclass
 class MsgNode:
@@ -64,7 +61,7 @@ class MsgNode:
 
 @discord_client.event
 async def on_message(new_msg):
-    global msg_nodes, last_task_time
+    global msg_nodes
 
     # Reload config for hot-reload
     cfg = get_config()
@@ -76,15 +73,15 @@ async def on_message(new_msg):
     if (not is_dm and discord_client.user not in new_msg.mentions) or new_msg.author.bot:
         return
 
-    # Permissions check (unchanged)
+    # Permissions check
     role_ids = {r.id for r in getattr(new_msg.author, "roles", [])}
     channel_ids = set(filter(None, (
         new_msg.channel.id,
         getattr(new_msg.channel, "parent_id", None),
         getattr(new_msg.channel, "category_id", None),
     )))
-    allow_dms   = cfg["allow_dms"]
-    perms       = cfg["permissions"]
+    allow_dms = cfg["allow_dms"]
+    perms = cfg["permissions"]
     (allowed_users, blocked_users), (allowed_roles, blocked_roles), (allowed_chs, blocked_chs) = (
         (perm["allowed_ids"], perm["blocked_ids"])
         for perm in (perms["users"], perms["roles"], perms["channels"])
@@ -109,7 +106,16 @@ async def on_message(new_msg):
         }
         resp = await httpx_client.post(n8n_webhook, json=payload)
         if resp.status_code == 200:
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError:
+                logging.error("n8n returned invalid JSON: %r", resp.text)
+                return
+
+            # handle array vs object
+            if isinstance(data, list) and data:
+                data = data[0]
+
             reply = data.get("reply")
             if reply:
                 await new_msg.reply(reply)
@@ -117,57 +123,37 @@ async def on_message(new_msg):
             logging.error(f"n8n webhook failed: {resp.status_code} {resp.text}")
         return
 
-    # ─── Fallback to original OpenAI streaming logic ───
-
-    # Provider init
+    # ─── Fallback: original OpenAI streaming logic ───
+    from openai import AsyncOpenAI  # delayed import
     provider, model = cfg["model"].split("/", 1)
     base_url = cfg["providers"][provider]["base_url"]
     api_key  = cfg["providers"][provider].get("api_key", "")
     openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
-    # Model-specific settings
-    accept_images    = any(tag in model.lower() for tag in VISION_MODEL_TAGS)
-    accept_usernames = provider in PROVIDERS_SUPPORTING_USERNAMES
-    max_text    = cfg["max_text"]
-    max_images  = cfg["max_images"] if accept_images else 0
-    max_messages= cfg["max_messages"]
-    use_plain   = cfg["use_plain_responses"]
-    max_len     = 2000 if use_plain else (4096 - len(STREAMING_INDICATOR))
+    accept_images = any(tag in model.lower() for tag in VISION_MODEL_TAGS)
+    max_text      = cfg["max_text"]
+    max_images    = cfg["max_images"] if accept_images else 0
+    max_messages  = cfg["max_messages"]
+    use_plain     = cfg["use_plain_responses"]
 
-    # Build history
+    # Build conversation history (simplified for brevity)
     messages = []
     curr = new_msg
     while curr and len(messages) < max_messages:
         node = msg_nodes.setdefault(curr.id, MsgNode())
         async with node.lock:
             if node.text is None:
-                txt = curr.content.removeprefix(discord_client.user.mention).strip()
-                atts = [a for a in curr.attachments if a.content_type and a.content_type.startswith(("text","image"))]
-                datas = await asyncio.gather(*[httpx_client.get(a.url) for a in atts])
-                node.text = "\n".join(
-                    ([txt] if txt else []) +
-                    [e.title or e.description or "" for e in curr.embeds] +
-                    [d.text for a,d in zip(atts, datas) if a.content_type.startswith("text")]
-                )
-                node.images = [
-                    {"type":"image_url","image_url":{"url":
-                     f"data:{a.content_type};base64,{b64encode(d.content).decode()}"}}
-                    for a,d in zip(atts, datas) if a.content_type.startswith("image")
-                ]
-                node.role    = "assistant" if curr.author == discord_client.user else "user"
-                node.user_id = curr.author.id if node.role=="user" else None
-            # assemble
+                cleaned = curr.content.removeprefix(discord_client.user.mention).strip()
+                node.text = cleaned or ""
+                node.role = "assistant" if curr.author == discord_client.user else "user"
+                node.user_id = curr.author.id if node.role == "user" else None
             if node.text:
-                msg = {"content":node.text[:max_text],"role":node.role}
-                if accept_usernames and node.user_id:
-                    msg["name"] = str(node.user_id)
-                messages.append(msg)
+                messages.append({"role": node.role, "content": node.text[:max_text]})
         curr = node.parent_msg
 
     # Optional system prompt
     if sp := cfg.get("system_prompt"):
-        extra = f"Today's date: {dt.now().strftime('%B %d %Y')}."
-        messages.append({"role":"system","content":f"{sp}\n{extra}"})
+        messages.append({"role": "system", "content": sp})
 
     # Stream from OpenAI
     kwargs = {
@@ -179,7 +165,7 @@ async def on_message(new_msg):
     try:
         async with new_msg.channel.typing():
             async for chunk in await openai_client.chat.completions.create(**kwargs):
-                # ... your existing chunk handling/editing logic ...
+                # ... existing chunk handling/editing logic ...
                 pass
     except Exception:
         logging.exception("Error in OpenAI streaming")
